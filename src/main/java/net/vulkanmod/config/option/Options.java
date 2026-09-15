@@ -379,6 +379,27 @@ public abstract class Options {
                 .setTooltip(v -> Component.translatable("vulkanmod.options.rt.lights.tooltip"))
                 .setImpact(PerformanceImpact.LOW);
 
+        // === M8.162 PBR-МАТЕРИАЛЫ ИЗ РЕСУРСПАКОВ === (просьба пользователя: «кнопка, чтобы шейдер
+        // читал PBR-паки avpbr/spbr»). Пак (AVPBR Retextured, SPBR и им подобные) кладёт рядом с
+        // текстурой блока две карты — <имя>_n (нормаль) и <имя>_s (гладкость/F0/металл/эмиссия);
+        // по ним трассировка получает РЕЛЬЕФ, честную шероховатость, металличность и свечение
+        // КАЖДОГО текселя, а не «материал по имени спрайта», как наша таблица.
+        // ⚠️ Ручка выключает РЕАЛЬНУЮ работу: без неё карты пака не читаются вовсе (RtPbrMaps.init
+        // молчит), ветка #define RT_PBR не компилируется, а карты отпускают память — на HD-паках это
+        // две текстуры размером с атлас, сотни мегабайт. Включение собирает их заново.
+        // Почему не HIGH: на кадр это одна выборка двух текстур, дороже становится только число
+        // зеркальных лучей там, где пак действительно гладкий.
+        var pbrOption = new SwitchOption(Component.translatable("vulkanmod.options.rt.pbr"),
+                value -> {
+                    config.rtPbr = value;
+                    // Выключили — карты недействительны (память в отставку, шейдер получит заглушки).
+                    // Включили — ничего не делаем: сборка ленивая, случится на следующем кадре.
+                    if (!value) net.vulkanmod.vulkan.rt.RtPbrMaps.invalidate();
+                },
+                () -> config.rtPbr)
+                .setTooltip(v -> Component.translatable("vulkanmod.options.rt.pbr.tooltip"))
+                .setImpact(PerformanceImpact.LOW);
+
         // M8.122: «Шейдеры» — наш пост (AgX + экранные эффекты) поверх ванильного растра при
         // выключенной трассировке. Иерархия (M8.122c, по слову пользователя): «Шейдеры» доступны
         // ВСЕГДА, и их выключение УТАСКИВАЕТ RT за собой (RT без шейдеров не работает) — виджет
@@ -400,6 +421,7 @@ public abstract class Options {
         // Трассировка выключена -> подчинённые ручки гаснут: они бы всё равно ни на что не влияли.
         Option<?>[] sub = { qualityOption,
                 shadowsOption, ambientOption, reflOption, cloudsOption, lightsOption, godRaysOption,
+                pbrOption,
                 upscalerOnOption, upscalerOption, denoiserOnOption, denoiserOption };
         for (Option<?> o : sub) o.setActivationFn(() -> rtOption.getNewValue());
         // M8.122e: DLSS — только на железе, где его инициализация не провалилась (старые GPU
@@ -461,7 +483,7 @@ public abstract class Options {
                 new OptionBlock(Component.translatable("vulkanmod.options.rt.block.light").getString(),
                         new Option<?>[]{ shadowsOption, ambientOption, lightsOption }),
                 new OptionBlock(Component.translatable("vulkanmod.options.rt.block.detail").getString(),
-                        new Option<?>[]{ reflOption, cloudsOption, godRaysOption })
+                        new Option<?>[]{ reflOption, cloudsOption, godRaysOption, pbrOption })
         };
     }
 
