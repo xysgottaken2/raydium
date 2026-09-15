@@ -139,6 +139,13 @@ public class RtSnapshot {
             layout(binding = 9) uniform sampler2D moonTex;     // ЛУНА Eclipse: карта сферы (equirect)
             layout(binding = 10) uniform sampler2D rainTex;    // ОСАДКИ: атлас MC дождь(верх)+снег(низ) 64x512
             layout(binding = 12) uniform sampler2D materialMap; // ОТРАЖЕНИЯ: matId по UV атласа (0=обычный)
+            #ifdef RT_PBR
+            // === M8.162 PBR ИЗ РЕСУРСПАКОВ (labPBR) === — те же UV, что у атласа и карты материалов.
+            // R,G = нормаль (DirectX: зелёный вниз), B = z (пересчитан при сборке, в паке там AO);
+            // R = гладкость, G = F0/металл, B = пористость, A = эмиссия. См. RtPbrMaps.
+            layout(binding = 21) uniform sampler2D pbrNormalTex;
+            layout(binding = 22) uniform sampler2D pbrMaterialTex;
+            #endif
 
             #ifdef ENT_TEX
             layout(binding = 4) uniform sampler2D entityTex[256];   // текстуры сущностей кадра
@@ -1136,6 +1143,121 @@ public class RtSnapshot {
             // в class-файле не может превышать 64 КБ в UTF-8, а кириллица занимает по два
             // байта на символ — комментарии перевесили. Склейка идёт по порядку, поэтому на
             // сам GLSL разрез не влияет; резать только по границе функций.
+            // M8.162: сюда же встал блок PBR-материалов из ресурспаков — отдельной константой,
+            // чтобы не перевалить 64 КБ в уже набитых блоках (см. тот же предел выше).
+            """
+            // ==================== M8.162 PBR-МАТЕРИАЛЫ ИЗ РЕСУРСПАКОВ (labPBR) ====================
+            // Паки (AVPBR Retextured, SPBR, Vanilla PBR и прочие) кладут рядом с текстурой блока две
+            // карты: <имя>_n (нормаль) и <имя>_s (спека). Java собирает из них ДВЕ текстуры в UV
+            // атласа (см. RtPbrMaps), шейдер сэмплит их по уже известному uv попадания.
+            // Разбор строго по labPBR 1.3: _s.R — перцептивная ГЛАДКОСТЬ (шероховатость = (1-s)^2),
+            // _s.G — F0 (0..229 линейно) или МЕТАЛЛ (230..237 по таблице, 255 = F0 равно альбедо),
+            // _s.A — ЭМИССИЯ (255 = не светится), _n.RG — нормаль (DirectX), _n.B — у пака AO
+            // (у нас занято Z, потому что Z мы считаем сами, как велит стандарт).
+            // ВАЖНО: «нет данных» = плоская нормаль и полностью погашенная спека, поэтому НЕ НУЖЕН
+            // признак «здесь есть пак»: отсутствие данных само ничего не добавляет.
+            #ifdef RT_PBR
+
+            // ТАНГЕНТ-БАЗИС ПОПАВШЕГО ТРЕУГОЛЬНИКА — из ЕГО ЖЕ позиций и UV, то есть из той самой
+            // развёртки, по которой рисовал художник. Так нормаль ложится правильно и на верхнюю
+            // грань, и на боковую, и на наклонную (ступени, забор, листва) без таблиц осей.
+            // labPBR хранит нормали в DirectX-виде (зелёный растёт ВНИЗ по картинке), а ∂P/∂v в MC
+            // смотрит ровно в сторону роста V — значит базис берём КАК ЕСТЬ, без разворота зелёного.
+            void triFrame(vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2, vec3 Ng, out vec3 T, out vec3 B){
+                vec3 n = normalize(Ng);
+                vec3 e1 = p1 - p0, e2 = p2 - p0;
+                vec2 d1 = t1 - t0, d2 = t2 - t0;
+                float det = d1.x * d2.y - d2.x * d1.y;
+                if (abs(det) < 1e-12) {                       // вырожденная развёртка — плоскость по нормали
+                    T = normalize(cross(abs(n.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0), n));
+                    B = cross(n, T);
+                    return;
+                }
+                float r = 1.0 / det;
+                vec3 T0 = (e1 * d2.y - e2 * d1.y) * r;
+                vec3 B0 = (e2 * d1.x - e1 * d2.x) * r;
+                T = T0 - n * dot(T0, n);
+                T = length(T) > 1e-6 ? normalize(T) : normalize(cross(abs(n.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0), n));
+                B = B0 - n * dot(B0, n);
+                B = length(B) > 1e-6 ? normalize(B) : cross(n, T);
+            }
+
+            // НОРМАЛЬ ИЗ ПАКА. В нашей карте лежит УЖЕ ЕДИНИЧНЫЙ вектор (Z посчитан при сборке),
+            // поэтому тут только перевод байтов в [-1..1] и перенос в тангент-базис. Нет данных ->
+            // (0,0,1) -> нормаль остаётся геометрической, и никаких ветвлений для этого не нужно.
+            vec3 pbrNormal(vec2 uv, vec3 Ng, vec3 T, vec3 B){
+                vec2 xy = texture(pbrNormalTex, uv).xy * 2.0 - 1.0;
+                float z2 = 1.0 - dot(xy, xy);
+                float z = z2 > 0.0 ? sqrt(z2) : 0.0;          // страховка от фильтра на кромке
+                return normalize(T * xy.x + B * xy.y + Ng * z);
+            }
+
+            // НОРМАЛЬ ИЗ ПАКА КАК ДОБАВКА к уже возмущённой нормали — для воды и льда: там база это
+            // наша аналитическая рябь, и «замена» стёрла бы её целиком (карта пака часто спокойнее).
+            vec3 pbrNormalAdd(vec2 uv, vec3 N, vec3 T, vec3 B){
+                vec2 xy = texture(pbrNormalTex, uv).xy * 2.0 - 1.0;
+                return normalize(N + T * xy.x + B * xy.y);
+            }
+
+            // UV ДЛЯ ВЫБОРКИ PBR-КАРТ. triUV отступает полтекселя АТЛАСА, а PBR-карта бывает вдвое
+            // мельче атласа (см. «ПАМЯТЬ» в RtPbrMaps) — там полтекселя БОЛЬШЕ, и у самой кромки
+            // спрайта билинейный фильтр затянул бы нормаль и спеку СОСЕДНЕГО блока. Поэтому у границ
+            // ТРЕУГОЛЬНИКА отступаем ещё раз, уже по размерам самой карты. В середине спрайта
+            // результат не меняется ни на волос: зажим там не срабатывает.
+            // ⚠️ Пад считается по СВОЕЙ карте: у заглушки 1x1 он равен половине UV, но ветка RT_PBR
+            // требует собранных карт, а в кадр пересборки шейдер читает заглушку — «нет данных»,
+            // и любой UV от неё не меняет картинку.
+            vec2 pbrUV(vec2 uv, vec2 u0, vec2 u1, vec2 u2){
+                vec2 pad = 0.5 / vec2(textureSize(pbrMaterialTex, 0));
+                vec2 lo = min(min(u0, u1), u2) + pad;
+                vec2 hi = max(max(u0, u1), u2) - pad;
+                return clamp(uv, min(lo, hi), max(lo, hi));
+            }
+
+            // МЕТАЛЛЫ labPBR (зелёный _s, коды 230..237). F0 — измеренные значения металлов
+            // (BD-RDF-таблицы Filament): у железа серое, у золота жёлтое, у меди медно-красное.
+            // ⚠️ СРАВНЕНИЯ ПО КОДАМ 0..255, А НЕ ПО ДРОБЯМ: границы 230/231 — это РАЗНЫЕ металлы, и
+            // промах на округлении покрасил бы золото медью.
+            vec3 labMetalF0(float g255){
+                if (g255 < 230.5) return vec3(0.560, 0.570, 0.580);   // железо
+                if (g255 < 231.5) return vec3(1.000, 0.766, 0.336);   // золото
+                if (g255 < 232.5) return vec3(0.913, 0.921, 0.925);   // алюминий
+                if (g255 < 233.5) return vec3(0.549, 0.556, 0.554);   // хром
+                if (g255 < 234.5) return vec3(0.955, 0.638, 0.538);   // медь
+                if (g255 < 235.5) return vec3(0.632, 0.626, 0.641);   // свинец
+                if (g255 < 236.5) return vec3(0.673, 0.637, 0.585);   // платина
+                if (g255 < 237.5) return vec3(0.972, 0.960, 0.915);   // серебро
+                return vec3(0.0);                                     // 238..254 стандартом не заданы
+            }
+
+            // ФИЗИКА ПОВЕРХНОСТИ ИЗ _s — ДОБАВКА к нашей таблице materials (matProps), не замена:
+            //   tint  — цвет зеркала, f0 — его сила (скаляр, как в matProps), str — «сколько зеркала»
+            //   (в matProps это 1 - шероховатость, здесь ровно то же), metal — металл ли тексель,
+            //   emis — сила эмиссии пака.
+            // ⚠️ КВАДРАТ ШЕРОХОВАТОСТИ — не косметика: labPBR хранит ГЛАДКОСТЬ, и без (1-s)^2
+            // матовые тексели пака блестели бы как полированные (стандарт задаёт именно квадрат).
+            void pbrSurface(vec2 uv, vec3 albedoLin, out vec3 tint, out float f0, out float str,
+                            out float metal, out float emis){
+                vec4 s = texture(pbrMaterialTex, uv);
+                float smoothness = s.r;
+                str   = 1.0 - (1.0 - smoothness) * (1.0 - smoothness);
+                emis  = s.a < 0.999 ? s.a : 0.0;               // 255 = «не светится» (так в labPBR)
+                float g255 = s.g * 255.0;
+                vec3 f0c;
+                if (g255 < 229.5)      { f0c = vec3(s.g); metal = 0.0; }         // 0..229 — F0 как число
+                else if (g255 < 237.5) { f0c = labMetalF0(g255); metal = 1.0; }   // 230..237 — металлы
+                // 238..254 стандартом НЕ назначены (таблица кончается серебром на 237), а 255 — «F0
+                // равно альбедо». Оба случая ведём по последнему: так советует и сам стандарт
+                // («шейдерпаки вправе вообще не знать таблицы металлов и читать 230..255 как 255»).
+                // ⚠️ Раньше сюда попадал весь диапазон 230..254, и любой неизвестный код давал F0=0 —
+                // пак молча гасил отражение там, где просил металл.
+                else                   { f0c = albedoLin; metal = 1.0; }
+                f0 = max(f0c.r, max(f0c.g, f0c.b));
+                tint = f0c / max(f0, 1e-3);
+                if (dot(f0c, f0c) < 1e-8) { f0 = 0.0; str = 0.0; metal = 0.0; }   // «нет данных» — не мешаем
+            }
+            #endif
+            """,
             """
             vec2 vUV(Verts vb, uint vi){
                 uint p = vb.w[vi*4u + 2u];
@@ -2356,6 +2478,16 @@ public class RtSnapshot {
                             vec3 gp0 = vPos(vb, tv.x);
                             vec3 gn = normalize(cross(vPos(vb, tv.y) - gp0, vPos(vb, tv.z) - gp0));
                             if (dot(gn, dir) > 0.0) gn = -gn;
+                        #ifdef RT_PBR
+                            // РЕЛЬЕФ СТЕКЛА/ЛЬДА ИЗ ПАКА: у льда в паках своя _n (трещины, наледь) —
+                            // добавляем к геометрической нормали грани, как и на воде (см. ветку ВОДЫ).
+                            {
+                                vec3 gT, gB;
+                                vec2 gu0 = vUV(vb,tv.x), gu1 = vUV(vb,tv.y), gu2 = vUV(vb,tv.z);
+                                triFrame(gp0, vPos(vb,tv.y), vPos(vb,tv.z), gu0, gu1, gu2, gn, gT, gB);
+                                gn = pbrNormalAdd(pbrUV(triUV(vb, tv, bary), gu0, gu1, gu2), gn, gT, gB);
+                            }
+                        #endif
                             vec2 guv  = triUV(vb, tv, bary);
                             vec4 gtex = atlasFetch(guv);
                             vec3 gvc  = w0*vCol(vb,tv.x) + w1*vCol(vb,tv.y) + w2*vCol(vb,tv.z);
@@ -2578,6 +2710,19 @@ public class RtSnapshot {
                             wn = wg;                                       // боковая грань — плоская
                         }
                         if (dot(wn, dir) > 0.0) wn = -wn;
+                    #ifdef RT_PBR
+                        // РЕЛЬЕФ ГЛАДИ ИЗ ПАКА. У AVPBR/SPBR у воды есть своя _n — мелкая рябь, которой
+                        // наша аналитическая волна не даёт. Функция именно ДОБАВЛЯЕТ наклон к уже
+                        // возмущённой нормали глади: там, где пак оставил карту плоской, волна остаётся
+                        // как была (замена стёрла бы её). Кадр берём первый — рябь будет статичной, но
+                        // вода не «замирает»: крупные волны у нас анимированные.
+                        {
+                            vec3 wT, wB;
+                            vec2 wu0 = vUV(vb,tv.x), wu1 = vUV(vb,tv.y), wu2 = vUV(vb,tv.z);
+                            triFrame(wp0, vPos(vb,tv.y), vPos(vb,tv.z), wu0, wu1, wu2, wg, wT, wB);
+                            wn = pbrNormalAdd(pbrUV(triUV(vb, tv, bary), wu0, wu1, wu2), wn, wT, wB);
+                        }
+                    #endif
                         // GUIDE: вода — гладкий диэлектрик, диффуза нет (цвет даёт преломление)
                         g_react  = 1.0;   // рябь бежит по неподвижной поверхности — накапливать нельзя
                         g_normal = wn;
@@ -2605,6 +2750,23 @@ public class RtSnapshot {
                         // ОТРАЖЕНИЕ: зеркальный луч ловит мир/сущности/ИГРОКА/небо.
                         // Небо гасим доступом неба у воды (wlm.y): в пещере кромка не светит.
                         vec3 refl = traceShade(hp + wn*0.02, reflect(dir, wn), smoothstep(0.0, 0.5, wlm.y));
+                    #ifdef RT_PBR
+                        // ШЕРOХОВАТОСТЬ ПАКА ГЛУШИТ ЗЕРКАЛО ГЛАДИ. У воды в паках она почти всегда
+                        // нулевая (гладкость 255 = ровная вода), но мутной/илистой воде пак вправе её
+                        // поднять — тогда острый луч заменяем аналитическим небом, как и на блоках.
+                        // F0 воды (0.02) НЕ берём из пака: это физическая константа, а не настройка.
+                        {
+                            vec3 wTint; float wF0, wStr, wMetal, wEmis;
+                            // Альбедо для случая «G = 255 (F0 равно альбедо)» передаём ЧЁРНЫМ: вода
+                            // прозрачная, её цвет даёт преломление, а не тексель. Такой тексель даёт
+                            // нулевой F0 и трактуется как «данных нет» — вода остаётся на своей
+                            // физической константе 0.02, и пак не может сделать её зеркалом.
+                            pbrSurface(pbrUV(triUV(vb, tv, bary), vUV(vb,tv.x), vUV(vb,tv.y), vUV(vb,tv.z)),
+                                       vec3(0.0), wTint, wF0, wStr, wMetal, wEmis);
+                            float wSharp = clamp(1.0 - (1.0 - wStr) * 1.6, 0.0, 1.0);
+                            refl = mix(skyRefl(reflect(dir, wn)), refl, wSharp);
+                        }
+                    #endif
                         // ПРЕЛОМЛЕНИЕ: вниз в воду до дна, тинт поглощением Eclipse по глубине
                         vec3 tdir = refract(dir, wn, 1.0/1.33);
                         vec3 refr;
@@ -2720,6 +2882,27 @@ public class RtSnapshot {
                     vec3 albedo = pow(albedoS, vec3(2.2));
                     if (!isEnt) albedo = applyCracks(albedo, hp, nrm);   // M8.16 трещины ломания
 
+                    // === M8.162 PBR ИЗ РЕСУРСПАКА (labPBR) ===
+                    // Всё, что пак говорит о поверхности: рельеф из _n и шероховатость/F0/металл/эмиссия
+                    // из _s. Значения по умолчанию НЕЙТРАЛЬНЫ (рельефа нет, зеркала нет, металла нет,
+                    // свечения нет), поэтому без пака блок шейдится ровно как раньше, а с паком
+                    // получает ДОБАВКУ. Складываем через max/min, а не подменяем: иначе пак отбирал бы
+                    // блеск у блоков, которым наша таблица материалов его уже дала (см. RtPbrMaps).
+                    float pbrStr = 0.0, pbrF0 = 0.0, pbrMetal = 0.0, pbrEmis = 0.0, pbrRough = 1.0;
+                    vec3  pbrTint = vec3(1.0);
+                #ifdef RT_PBR
+                    if (!isEnt) {   // у сущностей своя развёртка и свои текстуры — карты блоков не для них
+                        vec3 T, B;
+                        vec2 u0 = vUV(vb,tv.x), u1 = vUV(vb,tv.y), u2 = vUV(vb,tv.z);
+                        triFrame(p0, p0 + e1, p0 + e2, u0, u1, u2, nrm, T, B);
+                        vec2 puv = pbrUV(hitUV, u0, u1, u2);         // UV с отступом по карте пака
+                        nrm = pbrNormal(puv, nrm, T, B);                   // рельеф встаёт в освещение и в гайды
+                        pbrSurface(puv, albedo, pbrTint, pbrF0, pbrStr, pbrMetal, pbrEmis);
+                        pbrRough = clamp(1.0 - pbrStr, 0.02, 1.0);
+                    }
+                #endif
+                    """,
+                    """
                     // --- GUIDE для DLSS: что за поверхность в этом пикселе ---
                     g_normal = nrm;
                     g_viewZ  = dot(hp - origin.xyz, forward.xyz);
@@ -2736,6 +2919,17 @@ public class RtSnapshot {
                         g_spec  = vec3(0.04);                            // обычный диэлектрик
                         g_rough = 0.95;
                     }
+                #ifdef RT_PBR
+                    // ПАК ГОВОРИТ ТОЧНЕЕ ТАБЛИЦЫ. Гайды DLSS RR — это ФИЗИКА поверхности (диффуз,
+                    // зеркальное альбедо, шероховатость), и с данными пака реконструкция чище: сеть
+                    // видит полированный металл, а не «серый блок». Металл диффуза не имеет — его цвет
+                    // несёт отражение, поэтому диффузное альбедо гасим ровно на металличность пака.
+                    if (!isEnt && pbrStr > 0.0) {
+                        g_rough = min(g_rough, pbrRough);
+                        g_spec  = max(g_spec, pbrTint * pbrF0);
+                        g_diff  = albedo * (1.0 - pbrMetal);
+                    }
+                #endif
 
                     float ndl = max(dot(nrm, SUN_DIR_f()), 0.0);
                     float sun = (ndl>0.0 && dayDirect() > 0.01 && !inShadow(hp + nrm*0.02, SUN_DIR_f(), false)) ? ndl * dayDirect() : 0.0;
@@ -2842,7 +3036,15 @@ public class RtSnapshot {
                     } else {
                         dirLight = sun * SUN_COL_f() * dimDay();
                     }
-                    col = albedo * (ambient + dirLight) + lit;
+                    // ⚠️ МЕТАЛЛ НЕ РАССЕИВАЕТ (labPBR): его цвет несёт ОТРАЖЕНИЕ, а не диффуз. Гасим не
+                    // в ноль: отражение у нас острое (блюра по шероховатости нет), и полный металл
+                    // превратил бы блок в зеркальную плиту без текстуры — эту беду автор таблицы
+                    // материалов уже ловил (см. комментарий про 0.85-0.90 в matProps).
+                    float albMul = 1.0;
+                #ifdef RT_PBR
+                    albMul = 1.0 - 0.6 * pbrMetal;
+                #endif
+                    col = albedo * (ambient + dirLight) * albMul + lit * albMul;
                     // Сам источник светится (пламя, лава, светокамень) — иначе факел выглядит
                     // «выключенным»: он освещает стены, но сам остаётся тускло-серым.
                     // ⚠️ ТОЛЬКО БЛОКИ (M8.64). emissiveAt красит светом пламени всё, что попало ВНУТРЬ
@@ -2852,7 +3054,14 @@ public class RtSnapshot {
                     // стоит рядом с факелом: свет он получает блок-светом, как и все.
                     if (!isEnt) {   // M8.141: крупные блоки — эмиссия из карты (distance-independent),
                         bool fromMat; vec3 se = selfEmission(hitUV, albedo, fromMat);   // спец-режимы — буфер
-                        col += fromMat ? se : emissiveAt(hp, albedo, hitUV);
+                        vec3 seAdd = fromMat ? se : emissiveAt(hp, albedo, hitUV);
+                    #ifdef RT_PBR
+                        // ЭМИССИЯ ПАКА (альфа _s) ЗАМЕНЯЕТ нашу, а не добавляется: сложи мы оба —
+                        // светокамень и лава горели бы вдвое (таблица даёт свой цвет, пак свой), и это
+                        // читалось бы как засвет. Цвет свечения берём у самой текстуры — так велит labPBR.
+                        if (pbrEmis > 0.0) seAdd = albedo * pbrEmis * EMIS_BRIGHT;
+                    #endif
+                        col += seAdd;
                     }
                     // ⚠️ СВЕТЯЩИЙСЯ СЛОЙ СУЩНОСТИ (M8.66): глаза паука/эндермена (ванильный рендер-тайп
                     // "eyes") и эмиссивные слои ETF. Ваниль рисует их с ПОЛНОЙ яркостью, минуя
@@ -2900,11 +3109,37 @@ public class RtSnapshot {
                     // 1..9 — металлы/самоцветы/обсидиан; 16..21 — вторая волна (полировка, кварц,
                     // глазурь, руды, аметист, призмарин). 10..15 — прозрачные, 23/24 — эмиссия
                     // редстоуна: у них свои ветки, лишний луч отражения им не нужен.
-                    if (!isEnt && t < 128.0 && ((matId > 0u && matId < 10u) || (matId >= 16u && matId <= 21u))) {
+                    bool glossy = !isEnt && t < 128.0
+                            && ((matId > 0u && matId < 10u) || (matId >= 16u && matId <= 21u));
+                #ifdef RT_PBR
+                    // ПАК РАСШИРЯЕТ СПИСОК БЛЕСТЯЩИХ: у него блестит не «материал из таблицы», а любой
+                    // тексель со своей шероховатостью — глазурь, мокрый камень, полированный мод-блок.
+                    // Порог гладкости и гейт по дистанции держат число лучей в узде (как и было).
+                    glossy = glossy || (!isEnt && t < 128.0 && pbrStr > 0.45);
+                #endif
+                    if (glossy) {
                         vec3 mtint; float mf0; float mstr;
                         matProps(matId, mtint, mf0, mstr);
+                    #ifdef RT_PBR
+                        // ПАК СИЛЬНЕЕ ТАБЛИЦЫ — но только В СТОРОНУ БЛЕСКА (max, не подмена): иначе
+                        // блок, которому таблица уже дала отражение, потерял бы его там, где пак
+                        // оставил тексель матовым.
+                        if (!isEnt && pbrStr > mstr) { mstr = pbrStr; mtint = pbrTint; }
+                        mf0 = max(mf0, pbrF0);
+                    #endif
                         vec3 R = reflect(dir, nrm);
                         vec3 refl = traceShade(hp + nrm * 0.02, R, smoothstep(0.0, 0.5, skyL));
+                    #ifdef RT_PBR
+                        // ГЛАДКОСТЬ РЕШАЕТ, ЧТО ЛОВИТ ЛУЧ. Острый зеркальный луч описывает только
+                        // гладкую поверхность; шершавую он не описывает вовсе — точечная выборка среды
+                        // вместо её среднего. Для таких подмешиваем аналитическое НЕБО (низкочастотная
+                        // часть отражения) и гасим зеркальную составляющую: дешевле, чем блюрить трассу,
+                        // и честнее, чем показывать у матового блока резкое зеркало.
+                        if (!isEnt && pbrStr > 0.0) {
+                            float sharp = clamp(1.0 - pbrRough * 1.6, 0.0, 1.0);
+                            refl = mix(skyRefl(R), refl, sharp);
+                        }
+                    #endif
                         float ndv = max(dot(-dir, nrm), 0.0);
                         float F = mf0 + (1.0 - mf0) * pow(1.0 - ndv, 5.0);   // Schlick (у металлов F0 высокий)
                         // ТЕКСТУРА ЧИТАЕТСЯ В САМОМ ЗЕРКАЛЕ: отражение красит ТЕКСЕЛЬ (так делают
@@ -3716,7 +3951,7 @@ public class RtSnapshot {
             // 0=TLAS, 1=вывод(SSBO), 2=таблица адресов(SSBO), 3=атлас(sampler2D),
             // 4=текстуры сущностей (sampler2D[256]), 5=квад->слот текстуры (SSBO),
             // 6=ЦВЕТНЫЕ ИСТОЧНИКИ СВЕТА (SSBO), 7=наша текстура шума (эффекты камеры) — M8.12/95
-            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(21, stack);   // M8.153: +объём света
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(23, stack);   // M8.162: +PBR-карты пака
             binds.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
             binds.get(1).binding(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)   // M8.27: HDR-образ
@@ -3751,6 +3986,13 @@ public class RtSnapshot {
             // M8.153: решётка оттенка света (см. RtLightVolume)
             binds.get(20).binding(20).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+            // M8.162: PBR-карты ресурспака (labPBR _n/_s) в UV атласа — см. RtPbrMaps.
+            // ⚠️ Биндим их ВСЕГДА, даже когда ручка выключена: заглушка 1x1 с «нет данных» не
+            // искажает ничего, а ветка RT_PBR в шейдере тогда просто не скомпилирована.
+            binds.get(21).binding(21).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(22).binding(22).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
             VkDescriptorSetLayoutCreateInfo dslInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
                     .sType$Default().pBindings(binds);
             LongBuffer pDsl = stack.mallocLong(1);
@@ -3760,7 +4002,11 @@ public class RtSnapshot {
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(5, stack);
             poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(FRAMES);
             poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(5 * FRAMES);
-            poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount((6 + RtEntities.MAX_TEX) * FRAMES);
+            // M8.162: одиночных сэмплеров стало ВОСЕМЬ (атлас, шум, трещины, луна, осадки, карта
+            // материалов + две PBR-карты пака), плюс массив текстур сущностей на MAX_TEX слотов.
+            // ⚠️ Пул обязан быть не меньше набора: VkAllocateDescriptorSets с превышением вернёт
+            // ошибку, и RT не запустится вовсе.
+            poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount((8 + RtEntities.MAX_TEX) * FRAMES);
             poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(7 * FRAMES);   // HDR + 6 guide
             poolSizes.get(4).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(FRAMES);      // камера прошлого кадра
             VkDescriptorPoolCreateInfo dpInfo = VkDescriptorPoolCreateInfo.calloc(stack)
@@ -3882,6 +4128,10 @@ public class RtSnapshot {
         if (c.rtClouds)           d.append("#define RT_CLOUDS\n");
         if (c.rtGodRays)          d.append("#define RT_GODRAYS\n");
         if (c.rtAmbientRays > 0)  d.append("#define RT_AMBIENT\n");
+        // M8.162: PBR-материалы из ресурспака. Определение ставим ТОЛЬКО когда карты уже собраны
+        // (RtPbrMaps.init — ленивый, зовётся из записи дескрипторов): сэмплить нечего — не платим за
+        // ветку. Ручка выключена -> карты инвалидируются, определение уходит, пайплайн пересобирается.
+        if (c.rtPbr && RtPbrMaps.ready()) d.append("#define RT_PBR\n");
         return d.toString();
     }
 
@@ -4059,6 +4309,21 @@ public class RtSnapshot {
             matInfo.get(0).imageView(matTexV.getImageView()).sampler(matTexV.getSampler())
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+            // M8.162: PBR-КАРТЫ ПАКА (labPBR _n/_s, см. RtPbrMaps). Сборка ленивая: пока паков нет,
+            // ручка выключена или атлас ещё не сшит, RtPbrMaps отдаёт ЗАГЛУШКИ 1x1 «нет данных».
+            // ⚠️ Подставлять сюда атлас НЕЛЬЗЯ (в отличие от прочих текстур выше): шейдер принял бы
+            // альбедо за нормаль и развернул бы освещение. Заглушка же не искажает ничего.
+            RtPbrMaps.frameTick();   // отставные текстуры переживают 3 кадра — тут их и отпускаем
+            RtPbrMaps.init();
+            var pbrTexN = RtPbrMaps.normals();
+            var pbrTexS = RtPbrMaps.materials();
+            VkDescriptorImageInfo.Buffer pbrNInfo = VkDescriptorImageInfo.calloc(1, stack);
+            pbrNInfo.get(0).imageView(pbrTexN.getImageView()).sampler(pbrTexN.getSampler())
+                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            VkDescriptorImageInfo.Buffer pbrSInfo = VkDescriptorImageInfo.calloc(1, stack);
+            pbrSInfo.get(0).imageView(pbrTexS.getImageView()).sampler(pbrTexS.getSampler())
+                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
             VkDescriptorImageInfo.Buffer outInfo = VkDescriptorImageInfo.calloc(1, stack);
             outInfo.get(0).imageView(hdr.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
 
@@ -4198,7 +4463,7 @@ public class RtSnapshot {
             // M8.153: диапазон вырос на 16 байт — добавился rtCfg8 (начало решётки объёма света)
             camInfo.get(0).buffer(camUbo.buffer).offset(camOff).range(96 + OUTLINE_MAX_EDGES * 32 + 128);
 
-            VkWriteDescriptorSet.Buffer w = VkWriteDescriptorSet.calloc(21, stack);   // M8.153: +объём света
+            VkWriteDescriptorSet.Buffer w = VkWriteDescriptorSet.calloc(23, stack);   // M8.162: +PBR-карты пака
             w.get(12).sType$Default().dstSet(descSet).dstBinding(1)
                     .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).pImageInfo(outInfo);
             w.get(13).sType$Default().dstSet(descSet).dstBinding(13)
@@ -4242,6 +4507,12 @@ public class RtSnapshot {
             volInfo.get(0).buffer(RtLightVolume.bufferHandle()).offset(0).range(VK_WHOLE_SIZE);
             w.get(20).sType$Default().dstSet(descSet).dstBinding(20)
                     .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).pBufferInfo(volInfo);
+            // M8.162: PBR-карты пака. Биндим всегда (заглушка безвредна), сэмплит их шейдер только
+            // с #define RT_PBR — он появляется, когда карты реально собраны (см. pipelineDefines).
+            w.get(21).sType$Default().dstSet(descSet).dstBinding(21)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).pImageInfo(pbrNInfo);
+            w.get(22).sType$Default().dstSet(descSet).dstBinding(22)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).pImageInfo(pbrSInfo);
             vkUpdateDescriptorSets(device, w, null);
 
             ByteBuffer push = stack.malloc(256);

@@ -120,5 +120,7 @@
   "vulkanmod.options.rt.upscaler.on": "Upscaler",
   "vulkanmod.options.rt.upscaler.on.tooltip": "Trace at a lower resolution and reconstruct to screen size. Off = trace at native resolution (much heavier).",
   "vulkanmod.options.rt.denoiser.on": "Ray Reconstruction",
-  "vulkanmod.options.rt.denoiser.on.tooltip": "Removes the grain left by ray tracing. Off = raw traced image, noisy — useful for debugging only. Locked to DLSS while the upscaler is DLSS: Ray Reconstruction denoises and upscales in a single pass, so its denoising cannot be declined."
+  "vulkanmod.options.rt.denoiser.on.tooltip": "Removes the grain left by ray tracing. Off = raw traced image, noisy — useful for debugging only. Locked to DLSS while the upscaler is DLSS: Ray Reconstruction denoises and upscales in a single pass, so its denoising cannot be declined.",
+  "vulkanmod.options.rt.pbr": "PBR Resource Packs",
+  "vulkanmod.options.rt.pbr.tooltip": "Read material maps from PBR resource packs (labPBR: AVPBR, SPBR, Vanilla PBR and others). Each block then gets real relief, roughness, metallic and glow instead of the built-in material table: puddles and polished stone mirror the traced world, normal maps bend the shading and sun shadows, metals tint reflections with their own colour, and emissive textures light up on their own. Off = packs are not read at all, saves the memory the maps take."
 }

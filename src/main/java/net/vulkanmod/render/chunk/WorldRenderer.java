@@ -680,6 +680,10 @@ public class WorldRenderer {
             net.vulkanmod.vulkan.rt.RtWorld.resetWorld();
             net.vulkanmod.vulkan.rt.RtMaterialMap.invalidate();
             net.vulkanmod.vulkan.rt.RtCracks.invalidate();
+            // M8.162: смена паков/F3+T пересобирает и PBR-карты пака — их UV указывают в ТОТ ЖЕ
+            // атлас, и после пересборки они увели бы рельеф/спеку на чужие блоки. Сборка ленивая:
+            // случится на следующем кадре уже по новому атласу.
+            net.vulkanmod.vulkan.rt.RtPbrMaps.invalidate();
             net.vulkanmod.vulkan.rt.RtSnapshot.detectAlphaTagPack();   // M8.126: Actually 3D Stuff
         }
         // === /RT PATCH ===

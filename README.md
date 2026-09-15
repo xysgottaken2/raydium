@@ -27,6 +27,10 @@ on top, instead of screen-space tricks.
   geometry, puddles that dry out, lightning.
 - **Materials** — per-texel material map: metals and gems reflect, transparent blocks
   with their own IOR, emissive surfaces.
+- **PBR resource packs** — reads labPBR material maps (`_n` / `_s`, as shipped by AVPBR
+  Retextured, SPBR, Vanilla PBR and similar packs), so every block gets its own relief,
+  roughness, metallic and emissive data on top of the built-in material table. Resource
+  packs only — this is not Iris/OptiFine shaderpack support.
 - **Entities in RT** — mobs, the player, held items, particles, signs, maps and block
   breaking are all part of the traced scene (shadows, reflections, emission).
 - **Dimensions** — atmospheric grade for the Overworld, biome fog for the Nether,
